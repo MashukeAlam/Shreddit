@@ -1,0 +1,24 @@
+{
+  "name": "jobs",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@bull-board/api": "^6.14.0",
+    "@bull-board/express": "^6.14.0",
+    "@bull-board/ui": "^6.14.0",
+    "bullmq": "^5.62.0",
+    "clipboardy": "^5.0.0",
+    "express": "^5.1.0",
+    "puppeteer": "^24.27.0",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^5.1.7"
+  }
+}
