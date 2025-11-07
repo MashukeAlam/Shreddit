@@ -7,6 +7,11 @@ const { Worker } = require('bullmq');
 const puppeteer = require('puppeteer');
 const sqlite3 = require('sqlite3');
 const { open } = require('sqlite');
+const fs = require('fs').promises;
+const path = require('path');
+const fetch = globalThis.fetch || require('node-fetch');
+
+require('dotenv').config();
 
 const redditQueue = new Queue('redditQueue', {
   connection: {
@@ -16,30 +21,35 @@ const redditQueue = new Queue('redditQueue', {
 });
 
 const processedUrls = new Set();
+const RUN_CLIPBOARD_MONITOR = process.env.RUN_CLIPBOARD_MONITOR !== 'false';
 const INTERVAL = 3000;
 
-console.log('Monitoring clipboard for Reddit URLs...');
+if (RUN_CLIPBOARD_MONITOR) {
+  console.log('Clipboard Monitor running.');
+  
+  setInterval(async () => {
+    try {
+      let clipboardContent = await clipboard.default.read();
+      // console.log(clipboardContent);
+          
+      clipboardContent = (clipboardContent || '').trim();
 
-setInterval(async () => {
-  try {
-    let clipboardContent = await clipboard.default.read();
-    // console.log(clipboardContent);
-        
-    clipboardContent = (clipboardContent || '').trim();
+      const redditUrlRegex = /^(?:https?:\/\/)?(?:(?:www|old|np|i)\.)?(?:reddit\.com|redd\.it)\/[^\s?#]+(?:[^\s]*)?$/i;
 
-    const redditUrlRegex = /^(?:https?:\/\/)?(?:(?:www|old|np|i)\.)?(?:reddit\.com|redd\.it)\/[^\s?#]+(?:[^\s]*)?$/i;
-
-    if (redditUrlRegex.test(clipboardContent)) {
-      if (!processedUrls.has(clipboardContent)) {
-        await redditQueue.add('redditPost', { url: clipboardContent });        
-        processedUrls.add(clipboardContent);
-        // console.log(`Added new Reddit URL to queue: ${clipboardContent}`);
+      if (redditUrlRegex.test(clipboardContent)) {
+        if (!processedUrls.has(clipboardContent)) {
+          await redditQueue.add('redditPost', { url: clipboardContent });        
+          processedUrls.add(clipboardContent);
+          // console.log(`Added new Reddit URL to queue: ${clipboardContent}`);
+        }
       }
+    } catch (error) {
+      console.error('Error reading clipboard or adding to queue:', error);
     }
-  } catch (error) {
-    console.error('Error reading clipboard or adding to queue:', error);
-  }
-}, INTERVAL);
+  }, INTERVAL);
+} else {
+  console.log('Clipboard monitoring is disabled.');
+}
 
 // =================== Bull-Board setup ===================
 const app = express();
@@ -453,3 +463,86 @@ worker.on('failed', (job, err) => {
   console.error(`Job ${job.id} failed with error ${err && err.message ? err.message : err}`);
 });
 // ------------------------------------------------------------
+
+// process a single reddit listing JSON URL (paginated by `after`)
+async function processJsonListing(listingUrl) {
+  try {
+    let url = listingUrl;
+    while (url) {
+      const res = await fetch(url, { headers: { 'User-Agent': 'shreddit-bot/1.0' } });
+      if (!res.ok) {
+        console.error(`Failed to fetch ${url}: ${res.status}`);
+        break;
+      }
+      const json = await res.json();
+      const data = json && json.data;
+      if (!data) break;
+
+      const children = Array.isArray(data.children) ? data.children : [];
+      for (const child of children) {
+        const cdata = child && child.data;
+        if (!cdata) continue;
+        // prefer permalink (post page) otherwise fallback to data.url
+        const permalink = cdata.permalink;
+        const postUrl = permalink ? `https://www.reddit.com${permalink}` : (cdata.url || null);
+        if (!postUrl) continue;
+        if (!processedUrls.has(postUrl)) {
+          await redditQueue.add('redditPost', { url: postUrl });
+          processedUrls.add(postUrl);
+        }
+      }
+
+      const after = data.after || null;
+      if (!after) break;
+
+      // build next page url preserving original query params
+      try {
+        const u = new URL(listingUrl);
+        u.searchParams.set('after', after);
+        url = u.toString();
+      } catch (e) {
+        // fallback: append ?after=
+        url = `${listingUrl}${listingUrl.includes('?') ? '&' : '?'}after=${after}`;
+      }
+
+      // small delay to be polite
+      await new Promise(r => setTimeout(r, 800));
+    }
+  } catch (err) {
+    console.error('processJsonListing error for', listingUrl, err);
+  }
+}
+
+// process a plain url line (either json listing or a normal reddit post)
+async function processLine(line) {
+  const trimmed = (line || '').trim();
+  if (!trimmed) return;
+  if (trimmed.toLowerCase().endsWith('.json') || trimmed.toLowerCase().includes('.json?') ) {
+    await processJsonListing(trimmed);
+  } else {
+    if (!processedUrls.has(trimmed)) {
+      await redditQueue.add('redditPost', { url: trimmed });
+      processedUrls.add(trimmed);
+    }
+  }
+}
+
+// read urls.txt (one URL per line) and process them
+async function processUrlsFile(fileName = 'urls.txt') {
+  try {
+    const fp = path.resolve(process.cwd(), fileName);
+    const content = await fs.readFile(fp, 'utf8');
+    const lines = content.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    for (const line of lines) {
+      await processLine(line);
+    }
+    console.log(`Finished enqueueing URLs from ${fileName}`);
+  } catch (err) {
+    console.error('Failed to process urls file', err);
+  }
+}
+
+// kick off processing of ./urls.txt (non-blocking)
+processUrlsFile('urls.txt').catch(err => {
+  console.error('processUrlsFile fatal error', err);
+});

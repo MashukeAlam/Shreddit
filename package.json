@@ -16,6 +16,7 @@
     "@bull-board/ui": "^6.14.0",
     "bullmq": "^5.62.0",
     "clipboardy": "^5.0.0",
+    "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "puppeteer": "^24.27.0",
     "sqlite": "^5.1.1",
