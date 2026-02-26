@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>r/<%= sub.name %> — Gallery</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @keyframes blink { 0%,100% { opacity:1 } 50% { opacity:.35 } }
+    .blink { animation: blink 1.4s ease-in-out infinite }
+    .card img, .card video { transition: transform .2s ease }
+    .card:hover img, .card:hover video { transform: scale(1.03) }
+    #lightbox {
+      display: none; position: fixed; inset: 0; z-index: 50;
+      background: rgba(0,0,0,.92); align-items: center; justify-content: center; cursor: zoom-out;
+    }
+    #lightbox.open { display: flex }
+    #lightbox img, #lightbox video {
+      max-width: 92vw; max-height: 92vh; border-radius: .5rem;
+      box-shadow: 0 0 60px rgba(0,0,0,.6);
+    }
+    @keyframes fadeIn { from { opacity:0; transform:translateY(8px) } to { opacity:1; transform:none } }
+    .fade-in { animation: fadeIn .3s ease }
+    .vid-badge {
+      position: absolute; top: 8px; right: 8px;
+      background: rgba(0,0,0,.7); color: #fff; font-size: .65rem; font-weight: 600;
+      padding: 2px 6px; border-radius: 4px; pointer-events: none;
+    }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+
+<!-- lightbox -->
+<div id="lightbox" onclick="closeLightbox(event)">
+  <img id="lb-img" src="" alt="" style="display:none">
+  <video id="lb-vid" src="" controls autoplay style="display:none"></video>
+</div>
+
+<div class="max-w-[1400px] mx-auto px-4 py-8">
+  <header class="flex flex-wrap items-start justify-between gap-4 mb-8">
+    <div>
+      <a href="/" class="text-sm text-gray-500 hover:text-gray-300">&larr; Back</a>
+      <h1 class="text-3xl font-bold tracking-tight mt-1">r/<%= sub.name %></h1>
+      <div class="flex flex-wrap items-center gap-3 mt-1">
+        <% if (downloading) { %>
+          <span class="size-2 rounded-full bg-orange-400 blink"></span>
+          <span class="text-sm text-orange-400">Downloading…</span>
+        <% } else if (sub.status === 'complete') { %>
+          <span class="size-2 rounded-full bg-green-400"></span>
+          <span class="text-sm text-green-400">Complete</span>
+        <% } else { %>
+          <span class="size-2 rounded-full bg-red-400"></span>
+          <span class="text-sm text-red-400"><%= sub.status %></span>
+        <% } %>
+        <span class="text-sm text-gray-500" id="cnt">
+          <%= totalImages %> image<%= totalImages === 1 ? '' : 's' %> · <%= totalVideos %> video<%= totalVideos === 1 ? '' : 's' %>
+        </span>
+        <% if (totalVideoPending > 0) { %>
+          <span class="text-sm text-yellow-500" id="vidPending">(<%= totalVideoPending %> video<%= totalVideoPending === 1 ? '' : 's' %> processing…)</span>
+        <% } %>
+        <% if (sub.pages_fetched) { %>
+          <span class="text-sm text-gray-600">(<%= sub.pages_fetched %> pages fetched)</span>
+        <% } %>
+      </div>
+    </div>
+    <form method="POST" action="/scrape" class="flex gap-2">
+      <input type="hidden" name="subreddit" value="<%= sub.name %>">
+      <button class="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-sm font-medium rounded-lg transition">
+        Re‑scrape
+      </button>
+    </form>
+  </header>
+
+  <% if (totalMedia === 0 && downloading) { %>
+    <p class="text-center text-gray-500 mt-20" id="emptyMsg">Downloading media — the gallery will appear automatically…</p>
+  <% } else if (totalMedia === 0) { %>
+    <p class="text-center text-gray-600 mt-20">No images or videos found in this subreddit.</p>
+  <% } %>
+
+  <div id="gallery" class="columns-1 sm:columns-2 lg:columns-3 gap-4 [&>div]:mb-4"></div>
+
+  <!-- sentinel for infinite scroll -->
+  <div id="sentinel" class="flex items-center justify-center py-10">
+    <div id="loader" class="text-gray-600 text-sm"></div>
+  </div>
+</div>
+
+<script>
+const CHUNK = 20;
+const subName = '<%= sub.name %>';
+let offset = 0, loading = false, done = false;
+let totalKnown = <%= totalMedia %>;
+const gallery = document.getElementById('gallery');
+const loader = document.getElementById('loader');
+const sentinel = document.getElementById('sentinel');
+
+/* ---- Lightbox ---- */
+function openLb(src, type) {
+  const lbImg = document.getElementById('lb-img');
+  const lbVid = document.getElementById('lb-vid');
+  if (type === 'video') {
+    lbImg.style.display = 'none';
+    lbVid.style.display = 'block';
+    lbVid.src = src;
+    lbVid.play();
+  } else {
+    lbVid.style.display = 'none';
+    lbVid.pause();
+    lbVid.src = '';
+    lbImg.style.display = 'block';
+    lbImg.src = src;
+  }
+  document.getElementById('lightbox').classList.add('open');
+}
+function closeLightbox(e) {
+  // Don't close if clicking on the video controls
+  if (e.target.tagName === 'VIDEO') return;
+  const lb = document.getElementById('lightbox');
+  lb.classList.remove('open');
+  const lbVid = document.getElementById('lb-vid');
+  lbVid.pause();
+  lbVid.src = '';
+}
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeLightbox(e);
+});
+
+/* ---- Card builder ---- */
+function createCard(item) {
+  const div = document.createElement('div');
+  div.className = 'card break-inside-avoid mb-3 fade-in';
+  const title = (item.title || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+
+  if (item.type === 'video') {
+    div.innerHTML =
+      '<div class="relative rounded-lg overflow-hidden bg-gray-900 border border-gray-800 cursor-pointer"' +
+      ' onclick="openLb(\'/vid/' + item.id + '\', \'video\')">' +
+      '<video data-src="/vid/' + item.id + '" muted loop preload="none"' +
+      ' class="w-full block bg-gray-900" style="min-height:120px"' +
+      ' onloadeddata="this.style.minHeight=\'auto\'"' +
+      ' onmouseenter="this.play()" onmouseleave="this.pause();this.currentTime=0"></video>' +
+      '<span class="vid-badge">▶ VIDEO</span>' +
+      (item.title ? '<div class="px-2 py-1.5 text-xs text-gray-400 truncate">' + title + '</div>' : '') +
+      '</div>';
+  } else {
+    div.innerHTML =
+      '<div class="rounded-lg overflow-hidden bg-gray-900 border border-gray-800 cursor-pointer"' +
+      ' onclick="openLb(\'/img/' + item.id + '\', \'image\')">' +
+      '<img data-src="/img/' + item.id + '" alt="' + title + '"' +
+      ' class="w-full block bg-gray-900" style="min-height:120px"' +
+      ' onload="this.style.minHeight=\'auto\'">' +
+      (item.title ? '<div class="px-2 py-1.5 text-xs text-gray-400 truncate">' + title + '</div>' : '') +
+      '</div>';
+  }
+  return div;
+}
+
+/* ---- Lazy-load images & videos only when they enter viewport ---- */
+const mediaObserver = new IntersectionObserver(entries => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      const el = e.target;
+      if (el.dataset.src) {
+        el.src = el.dataset.src;
+        delete el.dataset.src;
+      }
+      mediaObserver.unobserve(el);
+    }
+  });
+}, { rootMargin: '400px 0px' });
+
+function updateCounts(imgCount, vidCount, vidPending) {
+  const label = imgCount + ' image' + (imgCount === 1 ? '' : 's') +
+                ' · ' + vidCount + ' video' + (vidCount === 1 ? '' : 's');
+  document.getElementById('cnt').textContent = label;
+  const vp = document.getElementById('vidPending');
+  if (vp) {
+    if (vidPending > 0) {
+      vp.textContent = '(' + vidPending + ' video' + (vidPending === 1 ? '' : 's') + ' processing…)';
+      vp.style.display = '';
+    } else {
+      vp.style.display = 'none';
+    }
+  }
+}
+
+async function loadChunk() {
+  if (loading || done) return;
+  loading = true;
+  loader.textContent = 'Loading media…';
+  try {
+    const r = await fetch('/api/r/' + subName + '/media?offset=' + offset + '&limit=' + CHUNK);
+    const d = await r.json();
+    if (!d.items.length) { done = true; loader.textContent = ''; return; }
+    d.items.forEach(item => {
+      const card = createCard(item);
+      gallery.appendChild(card);
+      const lazyEl = card.querySelector('[data-src]');
+      if (lazyEl) mediaObserver.observe(lazyEl);
+    });
+    offset += d.items.length;
+    totalKnown = d.total;
+    if (!d.hasMore) done = true;
+    loader.textContent = '';
+    const em = document.getElementById('emptyMsg');
+    if (em && d.items.length) em.remove();
+  } catch (e) {
+    loader.textContent = 'Error loading media';
+  } finally {
+    loading = false;
+  }
+}
+
+// Sentinel observer — triggers next chunk when user scrolls near bottom
+const sentinelObs = new IntersectionObserver(entries => {
+  if (entries[0].isIntersecting && !loading && !done) loadChunk();
+}, { rootMargin: '600px 0px' });
+sentinelObs.observe(sentinel);
+
+// Initial load
+loadChunk();
+
+<% if (downloading) { %>
+// Poll while downloading — update counts for images + videos
+let prevTotal = <%= totalMedia %>;
+setInterval(async () => {
+  try {
+    const r = await fetch('/api/r/' + subName);
+    const d = await r.json();
+    const newTotal = (d.count || 0) + (d.videos || 0);
+    updateCounts(d.count || 0, d.videos || 0, d.videosPending || 0);
+    if (newTotal > prevTotal) {
+      prevTotal = newTotal;
+      if (done) { done = false; loadChunk(); }
+    }
+    if (d.status !== 'downloading') {
+      // Even after scrape is complete, videos may still be processing
+      if ((d.videosPending || 0) > 0) {
+        // Keep polling until videos finish
+      } else {
+        location.reload();
+      }
+    }
+  } catch {}
+}, 3500);
+<% } else if (totalVideoPending > 0) { %>
+// Scrape done but videos still processing — poll for video completion
+setInterval(async () => {
+  try {
+    const r = await fetch('/api/r/' + subName);
+    const d = await r.json();
+    const newTotal = (d.count || 0) + (d.videos || 0);
+    updateCounts(d.count || 0, d.videos || 0, d.videosPending || 0);
+    if (newTotal > totalKnown) {
+      totalKnown = newTotal;
+      if (done) { done = false; loadChunk(); }
+    }
+    if ((d.videosPending || 0) === 0) location.reload();
+  } catch {}
+}, 4000);
+<% } %>
+</script>
+</body>
+</html>

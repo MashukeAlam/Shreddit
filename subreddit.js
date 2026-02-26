@@ -1,23 +1,33 @@
 const express = require('express');
+const path = require('path');
+const { Queue, Worker } = require('bullmq');
 const fetch = globalThis.fetch || require('node-fetch');
 
 const REDDIT_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-const MAX_PAGES = 10;           // 10 pages × 100 = up to 1 000 posts
+const MAX_PAGES_PER_FEED = 10;
 const MAX_IMG_BYTES = 10 * 1024 * 1024; // 10 MB
+const MAX_VIDEO_BYTES = 100 * 1024 * 1024; // 100 MB
 const CONCURRENT = 3;
+const REDIS_CONN = { host: 'localhost', port: 6379 };
+
+// BullMQ queue for video downloads
+const videoQueue = new Queue('videoDownloadQueue', { connection: REDIS_CONN });
+
+// Multiple feeds to exhaust more of the subreddit
+const FEEDS = [
+  { sort: 'top', t: 'all' },
+  { sort: 'top', t: 'year' },
+  { sort: 'top', t: 'month' },
+  { sort: 'top', t: 'week' },
+  { sort: 'hot' },
+  { sort: 'new' },
+  { sort: 'rising' },
+];
 
 // Track in‑flight scrapes so we don't double-start
 const activeScrapes = new Set();
 
 /* ---------- helpers ---------- */
-function esc(str = '') {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
 function extractImageUrls(d) {
   if (!d) return [];
   const out = [];
@@ -67,10 +77,65 @@ async function downloadImage(url) {
   } catch { return null; }
 }
 
+function extractVideoUrls(d) {
+  if (!d) return [];
+  const out = [];
+
+  // 1. Reddit hosted video (v.redd.it)
+  const rv = (d.media && d.media.reddit_video) || (d.secure_media && d.secure_media.reddit_video);
+  if (rv && rv.fallback_url) {
+    out.push({
+      url: rv.fallback_url.replace(/\?.*$/, ''),
+      audioUrl: rv.fallback_url.replace(/DASH_\d+\.mp4.*$/, 'DASH_AUDIO_128.mp4').replace(/DASH_\d+\.mp4.*$/, 'DASH_AUDIO_128.mp4'),
+      title: d.title,
+      postId: d.id,
+      duration: rv.duration || null,
+    });
+  }
+
+  // 2. Direct video link
+  if (out.length === 0 && d.url && /\.(mp4|webm|mov)(\?.*)?$/i.test(d.url)) {
+    out.push({ url: d.url, title: d.title, postId: d.id });
+  }
+
+  // 3. Preview video (reddit_video_preview)
+  if (out.length === 0 && d.preview && d.preview.reddit_video_preview) {
+    const pv = d.preview.reddit_video_preview;
+    if (pv.fallback_url) {
+      out.push({ url: pv.fallback_url.replace(/\?.*$/, ''), title: d.title, postId: d.id });
+    }
+  }
+
+  return out;
+}
+
+async function downloadVideo(url) {
+  try {
+    const res = await fetch(url, { headers: { 'User-Agent': REDDIT_UA }, redirect: 'follow' });
+    if (!res.ok) return null;
+    const ct = res.headers.get('content-type') || '';
+    const len = parseInt(res.headers.get('content-length') || '0', 10);
+    if (len > MAX_VIDEO_BYTES) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > MAX_VIDEO_BYTES || buf.length === 0) return null;
+    const contentType = ct.startsWith('video/') ? ct.split(';')[0] : 'video/mp4';
+    return { data: buf, contentType };
+  } catch { return null; }
+}
+
 /* ---------- module export ---------- */
 module.exports = function createSubredditRouter(getDb) {
   const router = express.Router();
   let tablesReady = false;
+
+  // Configure EJS view engine on the app (idempotent)
+  router.use((req, _res, next) => {
+    if (!req.app.get('view engine')) {
+      req.app.set('view engine', 'ejs');
+      req.app.set('views', path.join(__dirname, 'views'));
+    }
+    next();
+  });
 
   async function ensureTables() {
     if (tablesReady) return;
@@ -100,6 +165,21 @@ module.exports = function createSubredditRouter(getDb) {
         UNIQUE(subreddit_id, url)
       );
     `);
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS subreddit_videos (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        subreddit_id  INTEGER,
+        reddit_post_id TEXT,
+        url           TEXT,
+        title         TEXT,
+        video_data    BLOB,
+        content_type  TEXT,
+        status        TEXT DEFAULT 'pending',
+        created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(subreddit_id) REFERENCES subreddits(id),
+        UNIQUE(subreddit_id, url)
+      );
+    `);
     tablesReady = true;
   }
 
@@ -111,7 +191,7 @@ module.exports = function createSubredditRouter(getDb) {
       return;
     }
     activeScrapes.add(key);
-    console.log(`🚀 r/${key} — starting scrape (up to ${MAX_PAGES} pages)`);
+    console.log(`🚀 r/${key} — starting scrape (${FEEDS.length} feeds × up to ${MAX_PAGES_PER_FEED} pages each)`);
     const startTime = Date.now();
 
     const db = getDb();
@@ -126,17 +206,23 @@ module.exports = function createSubredditRouter(getDb) {
       await db.run('UPDATE subreddits SET status = ?, pages_fetched = 0 WHERE id = ?', 'downloading', sub.id);
     }
 
-    let after = null;
     let total = sub.total_images || 0;
+    let totalPages = 0;
 
     try {
-      for (let page = 0; page < MAX_PAGES; page++) {
-        let apiUrl = `https://www.reddit.com/r/${encodeURIComponent(key)}/top.json?t=all&limit=100&raw_json=1`;
-        if (after) apiUrl += `&after=${after}`;
+      for (const feed of FEEDS) {
+        const feedLabel = feed.t ? `${feed.sort}/${feed.t}` : feed.sort;
+        console.log(`\n📂 r/${key} — scraping feed: ${feedLabel}`);
+        let after = null;
 
-        console.log(`📄 r/${key} — fetching page ${page + 1}/${MAX_PAGES}${after ? ` (after=${after.slice(0,12)}…)` : ''}`);
-        const headers = { 'User-Agent': REDDIT_UA, 'Accept': 'application/json' };
-        let res = await fetch(apiUrl, { headers });
+        for (let page = 0; page < MAX_PAGES_PER_FEED; page++) {
+          let apiUrl = `https://www.reddit.com/r/${encodeURIComponent(key)}/${feed.sort}.json?limit=100&raw_json=1`;
+          if (feed.t) apiUrl += `&t=${feed.t}`;
+          if (after) apiUrl += `&after=${after}`;
+
+          console.log(`📄 r/${key} [${feedLabel}] — page ${page + 1}/${MAX_PAGES_PER_FEED}${after ? ` (after=${after.slice(0,12)}…)` : ''}`);
+          const headers = { 'User-Agent': REDDIT_UA, 'Accept': 'application/json' };
+          let res = await fetch(apiUrl, { headers });
 
         // Fallback to old.reddit.com if www returns 403
         if (res.status === 403) {
@@ -156,12 +242,40 @@ module.exports = function createSubredditRouter(getDb) {
         const listing = json && json.data;
         if (!listing || !listing.children || !listing.children.length) break;
 
-        // Collect image urls from this page
+        // Collect image + video urls from this page
         const images = [];
+        const videos = [];
         for (const child of listing.children) {
-          if (child.data) images.push(...extractImageUrls(child.data));
+          if (child.data) {
+            images.push(...extractImageUrls(child.data));
+            videos.push(...extractVideoUrls(child.data));
+          }
         }
-        console.log(`   └─ ${listing.children.length} posts scanned → ${images.length} image(s) found`);
+        console.log(`   └─ ${listing.children.length} posts scanned → ${images.length} image(s), ${videos.length} video(s) found`);
+
+        // Queue video downloads via BullMQ
+        for (const vid of videos) {
+          try {
+            const exists = await db.get(
+              'SELECT id FROM subreddit_videos WHERE subreddit_id = ? AND url = ?', sub.id, vid.url
+            );
+            if (!exists) {
+              await db.run(
+                `INSERT OR IGNORE INTO subreddit_videos (subreddit_id, reddit_post_id, url, title, status) VALUES (?, ?, ?, ?, ?)`,
+                sub.id, vid.postId, vid.url, vid.title, 'queued'
+              );
+              const row = await db.get('SELECT id FROM subreddit_videos WHERE subreddit_id = ? AND url = ?', sub.id, vid.url);
+              if (row) {
+                await videoQueue.add('downloadVideo', {
+                  videoDbId: row.id,
+                  url: vid.url,
+                  subredditName: key,
+                  title: vid.title,
+                }, { attempts: 3, backoff: { type: 'exponential', delay: 3000 } });
+              }
+            }
+          } catch { /* dup */ }
+        }
 
         // Download in batches
         let pageSaved = 0, pageSkipped = 0, pageFailed = 0;
@@ -194,14 +308,18 @@ module.exports = function createSubredditRouter(getDb) {
         }
         console.log(`   └─ 💾 ${pageSaved} saved, ⏭ ${pageSkipped} skipped (dup), ❌ ${pageFailed} failed  |  total: ${total}`);
 
-        await db.run('UPDATE subreddits SET pages_fetched = ? WHERE id = ?', page + 1, sub.id);
+        totalPages++;
+        await db.run('UPDATE subreddits SET pages_fetched = ? WHERE id = ?', totalPages, sub.id);
         after = listing.after;
         if (!after) {
-          console.log(`📭 r/${key} — no more pages (reached end of subreddit)`);
+          console.log(`📭 r/${key} [${feedLabel}] — no more pages in this feed`);
           break;
         }
         console.log(`⏳ r/${key} — waiting 1.2s before next page…`);
         await new Promise(r => setTimeout(r, 1200));
+      }
+      // small pause between feeds
+      await new Promise(r => setTimeout(r, 1500));
       }
 
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -225,102 +343,7 @@ module.exports = function createSubredditRouter(getDb) {
       if (!db) return res.status(503).send('DB not ready');
       await ensureTables();
       const subs = await db.all('SELECT * FROM subreddits ORDER BY created_at DESC');
-
-      res.send(/* html */`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Reddit Image Scraper</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<style>
-  @keyframes blink{0%,100%{opacity:1}50%{opacity:.35}}
-  .blink{animation:blink 1.4s ease-in-out infinite}
-</style>
-</head>
-<body class="bg-gray-950 text-gray-100 min-h-screen flex flex-col">
-<div class="max-w-3xl w-full mx-auto px-4 py-14 flex-1">
-
-  <!-- header -->
-  <div class="flex items-center gap-3 mb-1">
-    <div class="size-10 rounded-lg bg-orange-600 flex items-center justify-center text-white font-bold text-lg select-none">R</div>
-    <h1 class="text-3xl font-bold tracking-tight">Reddit Image Scraper</h1>
-  </div>
-  <p class="text-gray-500 text-sm mb-10">Enter a subreddit to download every image and browse them here.</p>
-
-  <!-- form -->
-  <form method="POST" action="/scrape" class="flex gap-3 mb-12">
-    <div class="relative flex-1">
-      <span class="absolute left-4 top-1/2 -translate-y-1/2 text-gray-500 font-semibold select-none">r/</span>
-      <input name="subreddit" required autocomplete="off" spellcheck="false"
-        placeholder="earthporn" 
-        class="w-full pl-10 pr-4 py-3 rounded-lg bg-gray-900 border border-gray-700 text-gray-100
-               placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-orange-500
-               focus:border-transparent transition">
-    </div>
-    <button class="px-6 py-3 bg-orange-600 hover:bg-orange-500 font-semibold rounded-lg transition whitespace-nowrap">
-      Scrape Images
-    </button>
-  </form>
-
-  <!-- list -->
-  <h2 class="text-lg font-semibold text-gray-400 mb-4">Scraped Subreddits</h2>
-  ${subs.length === 0
-    ? '<p class="text-gray-600">Nothing here yet — enter a subreddit above.</p>'
-    : `<div class="grid gap-3">${subs.map(s => `
-    <a href="/r/${esc(s.name)}"
-       class="flex items-center justify-between bg-gray-900 hover:bg-gray-800 border border-gray-800
-              rounded-lg p-4 transition group">
-      <div class="flex items-center gap-3">
-        <div class="size-9 rounded-full bg-gray-800 group-hover:bg-gray-700 flex items-center
-                    justify-center text-orange-400 font-bold">${esc(s.name[0].toUpperCase())}</div>
-        <div>
-          <span class="font-medium">r/${esc(s.name)}</span>
-          <span class="ml-3 text-sm text-gray-500">${s.total_images} image${s.total_images === 1 ? '' : 's'}</span>
-        </div>
-      </div>
-      <div class="flex items-center gap-2 text-sm">
-        ${s.status === 'downloading'
-          ? '<span class="size-2 rounded-full bg-orange-400 blink"></span><span class="text-orange-400">Downloading…</span>'
-          : s.status === 'complete'
-          ? '<span class="size-2 rounded-full bg-green-400"></span><span class="text-green-400">Complete</span>'
-          : s.status === 'error'
-          ? '<span class="size-2 rounded-full bg-red-400"></span><span class="text-red-400">Error</span>'
-          : '<span class="size-2 rounded-full bg-gray-600"></span><span class="text-gray-500">Pending</span>'}
-      </div>
-    </a>`).join('')}</div>`}
-</div>
-
-<footer class="flex items-center justify-center gap-4 text-xs text-gray-700 py-4 border-t border-gray-900">
-  <a href="/posts" class="hover:text-gray-400">Saved Posts</a>
-  <a href="/admin/queues" class="hover:text-gray-400">Bull Board</a>
-  <button onclick="killAll(this)" class="px-3 py-1.5 bg-red-600 hover:bg-red-500 text-white font-semibold rounded-md transition">Kill All Jobs</button>
-  <span id="qstats" class="text-gray-600"></span>
-</footer>
-<script>
-async function killAll(btn){
-  if(!confirm('Kill ALL queued & active BullMQ jobs?')) return;
-  btn.disabled=true; btn.textContent='Killing…';
-  try{
-    const r=await fetch('/api/kill-all-jobs',{method:'POST'});
-    const d=await r.json();
-    btn.textContent=d.ok?'✓ Done':'✗ Failed';
-    btn.classList.replace('bg-red-600',d.ok?'bg-green-600':'bg-red-800');
-    loadStats();
-    setTimeout(()=>{btn.textContent='Kill All Jobs';btn.disabled=false;
-      btn.classList.replace(d.ok?'bg-green-600':'bg-red-800','bg-red-600');},2000);
-  }catch{btn.textContent='✗ Error';btn.disabled=false;}
-}
-async function loadStats(){
-  try{
-    const r=await fetch('/api/queue-stats');
-    const d=await r.json();
-    document.getElementById('qstats').textContent=
-      'Queue: '+d.waiting+' waiting, '+d.active+' active, '+d.completed+' done, '+d.failed+' failed';
-  }catch{}
-}
-loadStats(); setInterval(loadStats,5000);
-</script>
-</body></html>`);
+      res.render('scraper/index', { subs });
     } catch (err) {
       console.error('GET / error', err);
       res.status(500).send('Server error');
@@ -344,9 +367,57 @@ loadStats(); setInterval(loadStats,5000);
       const name = req.params.name.toLowerCase();
       const sub = await db.get('SELECT * FROM subreddits WHERE name = ? COLLATE NOCASE', name);
       if (!sub) return res.json({ status: 'not_found', count: 0 });
-      const row = await db.get('SELECT COUNT(*) as cnt FROM subreddit_images WHERE subreddit_id = ?', sub.id);
-      res.json({ status: sub.status, count: row.cnt, pages: sub.pages_fetched });
-    } catch { res.json({ status: 'error', count: 0 }); }
+      const imgRow = await db.get('SELECT COUNT(*) as cnt FROM subreddit_images WHERE subreddit_id = ?', sub.id);
+      const vidRow = await db.get('SELECT COUNT(*) as cnt FROM subreddit_videos WHERE subreddit_id = ? AND status = ?', sub.id, 'done');
+      const vidPending = await db.get('SELECT COUNT(*) as cnt FROM subreddit_videos WHERE subreddit_id = ? AND status != ?', sub.id, 'done');
+      res.json({ status: sub.status, count: imgRow.cnt, videos: vidRow.cnt, videosPending: vidPending.cnt, pages: sub.pages_fetched });
+    } catch { res.json({ status: 'error', count: 0, videos: 0 }); }
+  });
+
+  // ---- API: paginated image list ----
+  router.get('/api/r/:name/images', async (req, res) => {
+    try {
+      const db = getDb();
+      if (!db) return res.json({ images: [] });
+      await ensureTables();
+      const name = req.params.name.toLowerCase();
+      const sub = await db.get('SELECT id FROM subreddits WHERE name = ? COLLATE NOCASE', name);
+      if (!sub) return res.json({ images: [] });
+      const offset = Math.max(0, parseInt(req.query.offset) || 0);
+      const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 60));
+      const images = await db.all(
+        'SELECT id, title FROM subreddit_images WHERE subreddit_id = ? ORDER BY id LIMIT ? OFFSET ?',
+        sub.id, limit, offset
+      );
+      const total = (await db.get('SELECT COUNT(*) as cnt FROM subreddit_images WHERE subreddit_id = ?', sub.id)).cnt;
+      res.json({ images, total, offset, limit, hasMore: offset + images.length < total });
+    } catch { res.json({ images: [], total: 0, hasMore: false }); }
+  });
+
+  // ---- API: paginated media list (images + videos) ----
+  router.get('/api/r/:name/media', async (req, res) => {
+    try {
+      const db = getDb();
+      if (!db) return res.json({ items: [] });
+      await ensureTables();
+      const name = req.params.name.toLowerCase();
+      const sub = await db.get('SELECT id FROM subreddits WHERE name = ? COLLATE NOCASE', name);
+      if (!sub) return res.json({ items: [] });
+      const offset = Math.max(0, parseInt(req.query.offset) || 0);
+      const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 20));
+      // Union images and videos ordered by creation time
+      const items = await db.all(`
+        SELECT id, title, 'image' as type FROM subreddit_images WHERE subreddit_id = ?
+        UNION ALL
+        SELECT id, title, 'video' as type FROM subreddit_videos WHERE subreddit_id = ? AND status = 'done'
+        ORDER BY id
+        LIMIT ? OFFSET ?
+      `, sub.id, sub.id, limit, offset);
+      const totalImg = (await db.get('SELECT COUNT(*) as cnt FROM subreddit_images WHERE subreddit_id = ?', sub.id)).cnt;
+      const totalVid = (await db.get('SELECT COUNT(*) as cnt FROM subreddit_videos WHERE subreddit_id = ? AND status = ?', sub.id, 'done')).cnt;
+      const total = totalImg + totalVid;
+      res.json({ items, total, offset, limit, hasMore: offset + items.length < total });
+    } catch { res.json({ items: [], total: 0, hasMore: false }); }
   });
 
   // ---- Gallery page ----
@@ -360,93 +431,13 @@ loadStats(); setInterval(loadStats,5000);
       const sub = await db.get('SELECT * FROM subreddits WHERE name = ? COLLATE NOCASE', name);
       if (!sub) return res.redirect('/');
 
-      const images = await db.all(
-        'SELECT id, title, content_type FROM subreddit_images WHERE subreddit_id = ? ORDER BY id', sub.id
-      );
+      const totalImg = (await db.get('SELECT COUNT(*) as cnt FROM subreddit_images WHERE subreddit_id = ?', sub.id)).cnt;
+      const totalVid = (await db.get('SELECT COUNT(*) as cnt FROM subreddit_videos WHERE subreddit_id = ? AND status = ?', sub.id, 'done')).cnt;
+      const totalVidPending = (await db.get('SELECT COUNT(*) as cnt FROM subreddit_videos WHERE subreddit_id = ? AND status != ?', sub.id, 'done')).cnt;
+      const totalMedia = totalImg + totalVid;
       const downloading = sub.status === 'downloading';
 
-      res.send(/* html */`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>r/${esc(sub.name)} — Images</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<style>
-  @keyframes blink{0%,100%{opacity:1}50%{opacity:.35}}
-  .blink{animation:blink 1.4s ease-in-out infinite}
-  .card img{transition:transform .2s ease}
-  .card:hover img{transform:scale(1.03)}
-  /* lightbox */
-  #lightbox{display:none;position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.92);
-    align-items:center;justify-content:center;cursor:zoom-out}
-  #lightbox.open{display:flex}
-  #lightbox img{max-width:92vw;max-height:92vh;border-radius:.5rem;box-shadow:0 0 60px rgba(0,0,0,.6)}
-</style>
-</head>
-<body class="bg-gray-950 text-gray-100 min-h-screen">
-
-<!-- lightbox -->
-<div id="lightbox" onclick="this.classList.remove('open')">
-  <img id="lb-img" src="" alt="">
-</div>
-
-<div class="max-w-[1400px] mx-auto px-4 py-8">
-  <header class="flex flex-wrap items-start justify-between gap-4 mb-8">
-    <div>
-      <a href="/" class="text-sm text-gray-500 hover:text-gray-300">&larr; Back</a>
-      <h1 class="text-3xl font-bold tracking-tight mt-1">r/${esc(sub.name)}</h1>
-      <div class="flex items-center gap-3 mt-1">
-        ${downloading
-          ? '<span class="size-2 rounded-full bg-orange-400 blink"></span><span class="text-sm text-orange-400">Downloading…</span>'
-          : sub.status === 'complete'
-          ? '<span class="size-2 rounded-full bg-green-400"></span><span class="text-sm text-green-400">Complete</span>'
-          : '<span class="size-2 rounded-full bg-red-400"></span><span class="text-sm text-red-400">' + esc(sub.status) + '</span>'}
-        <span class="text-sm text-gray-500" id="cnt">${images.length} image${images.length === 1 ? '' : 's'}</span>
-        ${sub.pages_fetched ? `<span class="text-sm text-gray-600">(${sub.pages_fetched} pages fetched)</span>` : ''}
-      </div>
-    </div>
-    <form method="POST" action="/scrape" class="flex gap-2">
-      <input type="hidden" name="subreddit" value="${esc(sub.name)}">
-      <button class="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-sm font-medium rounded-lg transition">
-        Re‑scrape
-      </button>
-    </form>
-  </header>
-
-  ${images.length === 0 && downloading ? '<p class="text-center text-gray-500 mt-20">Downloading images — the gallery will appear automatically…</p>' : ''}
-  ${images.length === 0 && !downloading ? '<p class="text-center text-gray-600 mt-20">No images found in this subreddit.</p>' : ''}
-
-  <div id="gallery" class="columns-2 sm:columns-3 lg:columns-4 xl:columns-5 gap-3 [&>div]:mb-3">
-    ${images.map(img => `
-    <div class="card break-inside-avoid">
-      <div class="rounded-lg overflow-hidden bg-gray-900 border border-gray-800 cursor-pointer"
-           onclick="openLb('/img/${img.id}')">
-        <img src="/img/${img.id}" alt="${esc(img.title || '')}" loading="lazy" class="w-full block">
-        ${img.title ? `<div class="px-2 py-1.5 text-xs text-gray-400 truncate">${esc(img.title)}</div>` : ''}
-      </div>
-    </div>`).join('')}
-  </div>
-</div>
-
-<script>
-function openLb(src){
-  const lb=document.getElementById('lightbox'),img=document.getElementById('lb-img');
-  img.src=src; lb.classList.add('open');
-}
-document.addEventListener('keydown',e=>{if(e.key==='Escape')document.getElementById('lightbox').classList.remove('open')});
-
-${downloading ? `
-// poll while downloading
-let lastCount=${images.length};
-setInterval(async()=>{
-  try{
-    const r=await fetch('/api/r/${sub.name}');
-    const d=await r.json();
-    if(d.count!==lastCount||d.status!=='downloading') location.reload();
-  }catch{}
-},3500);` : ''}
-</script>
-</body></html>`);
+      res.render('scraper/gallery', { sub, totalImages: totalImg, totalVideos: totalVid, totalVideoPending: totalVidPending, totalMedia, downloading });
     } catch (err) {
       console.error('GET /r/:name error', err);
       res.status(500).send('Server error');
@@ -472,5 +463,80 @@ setInterval(async()=>{
     }
   });
 
+  // ---- Serve video blob ----
+  router.get('/vid/:id', async (req, res) => {
+    try {
+      const db = getDb();
+      if (!db) return res.status(503).end();
+      const row = await db.get(
+        'SELECT video_data, content_type FROM subreddit_videos WHERE id = ? AND status = ?', Number(req.params.id), 'done'
+      );
+      if (!row || !row.video_data) return res.status(404).end();
+      const ct = row.content_type || 'video/mp4';
+      const buf = row.video_data;
+
+      // Support range requests for video seeking
+      const range = req.headers.range;
+      if (range) {
+        const parts = range.replace(/bytes=/, '').split('-');
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : buf.length - 1;
+        const chunk = buf.slice(start, end + 1);
+        res.writeHead(206, {
+          'Content-Range': `bytes ${start}-${end}/${buf.length}`,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': chunk.length,
+          'Content-Type': ct,
+          'Cache-Control': 'public, max-age=604800, immutable',
+        });
+        res.end(chunk);
+      } else {
+        res.set({
+          'Content-Type': ct,
+          'Content-Length': buf.length,
+          'Accept-Ranges': 'bytes',
+          'Cache-Control': 'public, max-age=604800, immutable',
+        });
+        res.send(buf);
+      }
+    } catch {
+      res.status(500).end();
+    }
+  });
+
+  // ---- BullMQ Video Download Worker ----
+  const videoWorker = new Worker('videoDownloadQueue', async (job) => {
+    const { videoDbId, url, subredditName, title } = job.data;
+    const db = getDb();
+    if (!db) throw new Error('DB not ready');
+
+    console.log(`🎬 Downloading video: ${title || url}`);
+    await db.run('UPDATE subreddit_videos SET status = ? WHERE id = ?', 'downloading', videoDbId);
+
+    const result = await downloadVideo(url);
+    if (!result) {
+      await db.run('UPDATE subreddit_videos SET status = ? WHERE id = ?', 'failed', videoDbId);
+      console.log(`❌ Video download failed: ${title || url}`);
+      throw new Error(`Failed to download video: ${url}`);
+    }
+
+    await db.run(
+      'UPDATE subreddit_videos SET video_data = ?, content_type = ?, status = ? WHERE id = ?',
+      result.data, result.contentType, 'done', videoDbId
+    );
+    const sizeMB = (result.data.length / 1024 / 1024).toFixed(1);
+    console.log(`✅ Video saved (${sizeMB} MB): ${title || url}`);
+  }, {
+    connection: REDIS_CONN,
+    concurrency: 2,
+  });
+
+  videoWorker.on('failed', (job, err) => {
+    console.error(`❌ Video job ${job.id} failed: ${err.message}`);
+  });
+
   return router;
 };
+
+// Export so index.js can register it on Bull Board
+module.exports.videoQueue = videoQueue;

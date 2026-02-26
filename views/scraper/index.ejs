@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Reddit Image Scraper</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @keyframes blink { 0%,100% { opacity:1 } 50% { opacity:.35 } }
+    .blink { animation: blink 1.4s ease-in-out infinite }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen flex flex-col">
+<div class="max-w-3xl w-full mx-auto px-4 py-14 flex-1">
+
+  <!-- header -->
+  <div class="flex items-center gap-3 mb-1">
+    <div class="size-10 rounded-lg bg-orange-600 flex items-center justify-center text-white font-bold text-lg select-none">R</div>
+    <h1 class="text-3xl font-bold tracking-tight">Reddit Image Scraper</h1>
+  </div>
+  <p class="text-gray-500 text-sm mb-10">Enter a subreddit to download every image and browse them here.</p>
+
+  <!-- form -->
+  <form method="POST" action="/scrape" class="flex gap-3 mb-12">
+    <div class="relative flex-1">
+      <span class="absolute left-4 top-1/2 -translate-y-1/2 text-gray-500 font-semibold select-none">r/</span>
+      <input name="subreddit" required autocomplete="off" spellcheck="false"
+        placeholder="earthporn"
+        class="w-full pl-10 pr-4 py-3 rounded-lg bg-gray-900 border border-gray-700 text-gray-100
+               placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-orange-500
+               focus:border-transparent transition">
+    </div>
+    <button class="px-6 py-3 bg-orange-600 hover:bg-orange-500 font-semibold rounded-lg transition whitespace-nowrap">
+      Scrape Images
+    </button>
+  </form>
+
+  <!-- subreddit list -->
+  <h2 class="text-lg font-semibold text-gray-400 mb-4">Scraped Subreddits</h2>
+
+  <% if (subs.length === 0) { %>
+    <p class="text-gray-600">Nothing here yet — enter a subreddit above.</p>
+  <% } else { %>
+    <div class="grid gap-3">
+      <% for (const s of subs) { %>
+        <a href="/r/<%= s.name %>"
+           class="flex items-center justify-between bg-gray-900 hover:bg-gray-800 border border-gray-800
+                  rounded-lg p-4 transition group">
+          <div class="flex items-center gap-3">
+            <div class="size-9 rounded-full bg-gray-800 group-hover:bg-gray-700 flex items-center
+                        justify-center text-orange-400 font-bold"><%= s.name[0].toUpperCase() %></div>
+            <div>
+              <span class="font-medium">r/<%= s.name %></span>
+              <span class="ml-3 text-sm text-gray-500"><%= s.total_images %> image<%= s.total_images === 1 ? '' : 's' %></span>
+            </div>
+          </div>
+          <div class="flex items-center gap-2 text-sm">
+            <% if (s.status === 'downloading') { %>
+              <span class="size-2 rounded-full bg-orange-400 blink"></span>
+              <span class="text-orange-400">Downloading…</span>
+            <% } else if (s.status === 'complete') { %>
+              <span class="size-2 rounded-full bg-green-400"></span>
+              <span class="text-green-400">Complete</span>
+            <% } else if (s.status === 'error') { %>
+              <span class="size-2 rounded-full bg-red-400"></span>
+              <span class="text-red-400">Error</span>
+            <% } else { %>
+              <span class="size-2 rounded-full bg-gray-600"></span>
+              <span class="text-gray-500">Pending</span>
+            <% } %>
+          </div>
+        </a>
+      <% } %>
+    </div>
+  <% } %>
+</div>
+
+<footer class="flex items-center justify-center gap-4 text-xs text-gray-700 py-4 border-t border-gray-900">
+  <a href="/posts" class="hover:text-gray-400">Saved Posts</a>
+  <a href="/admin/queues" class="hover:text-gray-400">Bull Board</a>
+  <button onclick="killAll(this)" class="px-3 py-1.5 bg-red-600 hover:bg-red-500 text-white font-semibold rounded-md transition">Kill All Jobs</button>
+  <span id="qstats" class="text-gray-600"></span>
+</footer>
+
+<script>
+async function killAll(btn) {
+  if (!confirm('Kill ALL queued & active BullMQ jobs?')) return;
+  btn.disabled = true;
+  btn.textContent = 'Killing…';
+  try {
+    const r = await fetch('/api/kill-all-jobs', { method: 'POST' });
+    const d = await r.json();
+    btn.textContent = d.ok ? '✓ Done' : '✗ Failed';
+    btn.classList.replace('bg-red-600', d.ok ? 'bg-green-600' : 'bg-red-800');
+    loadStats();
+    setTimeout(() => {
+      btn.textContent = 'Kill All Jobs';
+      btn.disabled = false;
+      btn.classList.replace(d.ok ? 'bg-green-600' : 'bg-red-800', 'bg-red-600');
+    }, 2000);
+  } catch {
+    btn.textContent = '✗ Error';
+    btn.disabled = false;
+  }
+}
+
+async function loadStats() {
+  try {
+    const r = await fetch('/api/queue-stats');
+    const d = await r.json();
+    let txt = 'Posts: ' + d.waiting + 'w/' + d.active + 'a/' + d.completed + 'd/' + d.failed + 'f';
+    if (d.video) {
+      txt += '  |  Videos: ' + d.video.waiting + 'w/' + d.video.active + 'a/' + d.video.completed + 'd/' + d.video.failed + 'f';
+    }
+    document.getElementById('qstats').textContent = txt;
+  } catch {}
+}
+loadStats();
+setInterval(loadStats, 5000);
+</script>
+</body>
+</html>

@@ -8,8 +8,24 @@ const puppeteer = require('puppeteer');
 const sqlite3 = require('sqlite3');
 const { open } = require('sqlite');
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const path = require('path');
 const fetch = globalThis.fetch || require('node-fetch');
+
+// ---- Tee console output to history.log ----
+const logStream = fsSync.createWriteStream(path.join(__dirname, 'history.log'), { flags: 'a' });
+const origLog = console.log.bind(console);
+const origErr = console.error.bind(console);
+function stamp() { return new Date().toISOString(); }
+console.log = (...args) => {
+  origLog(...args);
+  logStream.write(`[${stamp()}] ${args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ')}\n`);
+};
+console.error = (...args) => {
+  origErr(...args);
+  logStream.write(`[${stamp()}] ERROR ${args.map(a => typeof a === 'string' ? a : (a instanceof Error ? a.stack || a.message : JSON.stringify(a))).join(' ')}\n`);
+};
+// --------------------------------------------
 
 require('dotenv').config();
 
@@ -56,8 +72,14 @@ const app = express();
 const serverAdapter = new ExpressAdapter();
 serverAdapter.setBasePath('/admin/queues');
 
+const { BullMQAdapter } = require('@bull-board/api/bullMQAdapter');
+const { videoQueue } = require('./subreddit');
+
 createBullBoard({
-  queues: [new (require('@bull-board/api/bullMQAdapter').BullMQAdapter)(redditQueue)],
+  queues: [
+    new BullMQAdapter(redditQueue),
+    new BullMQAdapter(videoQueue),
+  ],
   serverAdapter,
 });
 
@@ -71,9 +93,11 @@ app.use(express.json());
 // ---- Kill all BullMQ jobs ----
 app.post('/api/kill-all-jobs', async (_req, res) => {
   try {
-    // Obliterate removes all jobs in every state
-    await redditQueue.obliterate({ force: true });
-    console.log('🗑️  All BullMQ jobs obliterated');
+    await Promise.all([
+      redditQueue.obliterate({ force: true }),
+      videoQueue.obliterate({ force: true }),
+    ]);
+    console.log('🗑️  All BullMQ jobs obliterated (reddit + video queues)');
     res.json({ ok: true, message: 'All jobs killed' });
   } catch (err) {
     console.error('Kill all jobs error:', err);
@@ -91,7 +115,13 @@ app.get('/api/queue-stats', async (_req, res) => {
       redditQueue.getCompletedCount(),
       redditQueue.getFailedCount(),
     ]);
-    res.json({ waiting, active, delayed, completed, failed });
+    const [vWaiting, vActive, vFailed, vCompleted] = await Promise.all([
+      videoQueue.getWaitingCount(),
+      videoQueue.getActiveCount(),
+      videoQueue.getFailedCount(),
+      videoQueue.getCompletedCount(),
+    ]);
+    res.json({ waiting, active, delayed, completed, failed, video: { waiting: vWaiting, active: vActive, failed: vFailed, completed: vCompleted } });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
