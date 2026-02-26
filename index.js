@@ -64,6 +64,43 @@ createBullBoard({
 app.use('/admin/queues', serverAdapter.getRouter());
 // ========================================================
 
+// ---- Body parsing + Subreddit image scraper ----
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+
+// ---- Kill all BullMQ jobs ----
+app.post('/api/kill-all-jobs', async (_req, res) => {
+  try {
+    // Obliterate removes all jobs in every state
+    await redditQueue.obliterate({ force: true });
+    console.log('🗑️  All BullMQ jobs obliterated');
+    res.json({ ok: true, message: 'All jobs killed' });
+  } catch (err) {
+    console.error('Kill all jobs error:', err);
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+// ---- Get queue stats ----
+app.get('/api/queue-stats', async (_req, res) => {
+  try {
+    const [waiting, active, delayed, completed, failed] = await Promise.all([
+      redditQueue.getWaitingCount(),
+      redditQueue.getActiveCount(),
+      redditQueue.getDelayedCount(),
+      redditQueue.getCompletedCount(),
+      redditQueue.getFailedCount(),
+    ]);
+    res.json({ waiting, active, delayed, completed, failed });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const createSubredditRouter = require('./subreddit');
+app.use(createSubredditRouter(() => db));
+// -------------------------------------------------
+
 function escapeHtml(str = '') {
   return String(str)
     .replace(/&/g, '&amp;')
@@ -101,8 +138,9 @@ app.get('/posts', async (req, res) => {
               <div class="w-10 h-10 rounded-md bg-amber-500 text-white flex items-center justify-center font-semibold">S</div>
               <h1 class="text-2xl font-semibold tracking-tight">Shreddit</h1>
             </div>
-            <nav class="space-x-4 text-sm">
+            <nav class="flex items-center gap-4 text-sm">
               <a href="/admin/queues" class="text-slate-600 hover:text-slate-900">Bull Board</a>
+              <button onclick="killAll(this)" class="px-3 py-1.5 bg-red-600 hover:bg-red-500 text-white text-xs font-semibold rounded-md transition">Kill All Jobs</button>
             </nav>
           </header>
 
@@ -126,6 +164,20 @@ app.get('/posts', async (req, res) => {
             <p>Built with care — for the upcoming <span class="font-semibold">apocalypse.</span></p>
           </footer>
         </div>
+      <script>
+      async function killAll(btn){
+        if(!confirm('Kill ALL queued & active jobs?')) return;
+        btn.disabled=true; btn.textContent='Killing…';
+        try{
+          const r=await fetch('/api/kill-all-jobs',{method:'POST'});
+          const d=await r.json();
+          btn.textContent=d.ok?'✓ Done':'✗ Failed';
+          btn.classList.replace('bg-red-600',d.ok?'bg-green-600':'bg-red-800');
+          setTimeout(()=>{btn.textContent='Kill All Jobs';btn.disabled=false;
+            btn.classList.replace(d.ok?'bg-green-600':'bg-red-800','bg-red-600');},2000);
+        }catch{btn.textContent='✗ Error';btn.disabled=false;}
+      }
+      </script>
       </body>
       </html>
     `);
@@ -469,7 +521,8 @@ async function processJsonListing(listingUrl) {
   try {
     let url = listingUrl;
     while (url) {
-      const res = await fetch(url, { headers: { 'User-Agent': 'shreddit-bot/1.0' } });
+      const res = await fetch(url);
+            
       if (!res.ok) {
         console.error(`Failed to fetch ${url}: ${res.status}`);
         break;

@@ -1,3 +1,0 @@
-https://www.reddit.com/r/degoogle/.json
-https://www.reddit.com/r/Windows11/.json
-https://www.reddit.com/r/leetcode/.json
