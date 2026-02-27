@@ -8,8 +8,8 @@ const MAX_PAGES_PER_FEED = 10;
 const MAX_IMG_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_VIDEO_BYTES = 100 * 1024 * 1024; // 100 MB
 const MAX_IMAGES = 600;
-const MAX_VIDEOS = 100;
-const MAX_REDGIFS = 200;
+const MAX_VIDEOS = 50;
+const MAX_REDGIFS = 100;
 const CONCURRENT = 3;
 const REDIS_CONN = { host: process.env.REDIS_HOST || 'localhost', port: parseInt(process.env.REDIS_PORT) || 6379 };
 
