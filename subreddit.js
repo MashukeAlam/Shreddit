@@ -7,8 +7,11 @@ const REDDIT_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, li
 const MAX_PAGES_PER_FEED = 10;
 const MAX_IMG_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_VIDEO_BYTES = 100 * 1024 * 1024; // 100 MB
+const MAX_IMAGES = 600;
+const MAX_VIDEOS = 100;
+const MAX_REDGIFS = 200;
 const CONCURRENT = 3;
-const REDIS_CONN = { host: 'localhost', port: 6379 };
+const REDIS_CONN = { host: process.env.REDIS_HOST || 'localhost', port: parseInt(process.env.REDIS_PORT) || 6379 };
 
 // BullMQ queue for video downloads
 const videoQueue = new Queue('videoDownloadQueue', { connection: REDIS_CONN });
@@ -16,12 +19,8 @@ const videoQueue = new Queue('videoDownloadQueue', { connection: REDIS_CONN });
 // Multiple feeds to exhaust more of the subreddit
 const FEEDS = [
   { sort: 'top', t: 'all' },
-  { sort: 'top', t: 'year' },
-  { sort: 'top', t: 'month' },
-  { sort: 'top', t: 'week' },
   { sort: 'hot' },
   { sort: 'new' },
-  { sort: 'rising' },
 ];
 
 // Track in‑flight scrapes so we don't double-start
@@ -123,6 +122,60 @@ async function downloadVideo(url) {
   } catch { return null; }
 }
 
+/* ---------- RedGifs helpers ---------- */
+let redgifsToken = null;
+let redgifsTokenExpiry = 0;
+
+async function getRedgifsToken() {
+  if (redgifsToken && Date.now() < redgifsTokenExpiry) return redgifsToken;
+  try {
+    const res = await fetch('https://api.redgifs.com/v2/auth/temporary', {
+      headers: { 'User-Agent': REDDIT_UA },
+    });
+    if (!res.ok) { console.error('❌ RedGifs auth failed:', res.status); return null; }
+    const data = await res.json();
+    redgifsToken = data.token;
+    redgifsTokenExpiry = Date.now() + 20 * 60 * 60 * 1000; // refresh after 20h
+    console.log('🔑 RedGifs auth token acquired');
+    return redgifsToken;
+  } catch (err) {
+    console.error('❌ RedGifs auth error:', err.message);
+    return null;
+  }
+}
+
+async function resolveRedgifsUrl(gifId) {
+  const token = await getRedgifsToken();
+  if (!token) return null;
+  try {
+    const res = await fetch(`https://api.redgifs.com/v2/gifs/${gifId.toLowerCase()}`, {
+      headers: { 'User-Agent': REDDIT_UA, 'Authorization': `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      if (res.status === 401) { redgifsToken = null; redgifsTokenExpiry = 0; }
+      return null;
+    }
+    const data = await res.json();
+    const urls = data.gif && data.gif.urls;
+    if (!urls) return null;
+    return urls.hd || urls.sd || null;
+  } catch { return null; }
+}
+
+function extractRedgifsUrls(d) {
+  if (!d) return [];
+  const out = [];
+  const urlsToCheck = [d.url, d.url_overridden_by_dest].filter(Boolean);
+  for (const u of urlsToCheck) {
+    const m = u.match(/redgifs\.com\/watch\/(\w+)/i);
+    if (m) {
+      out.push({ url: u, title: d.title, postId: d.id, redgifsId: m[1] });
+      break; // one per post
+    }
+  }
+  return out;
+}
+
 /* ---------- module export ---------- */
 module.exports = function createSubredditRouter(getDb) {
   const router = express.Router();
@@ -141,6 +194,7 @@ module.exports = function createSubredditRouter(getDb) {
     if (tablesReady) return;
     const db = getDb();
     if (!db) return;
+    
     await db.exec(`
       CREATE TABLE IF NOT EXISTS subreddits (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,14 +238,18 @@ module.exports = function createSubredditRouter(getDb) {
   }
 
   /* ---- background scraper ---- */
-  async function scrapeSubreddit(name) {
+  async function scrapeSubreddit(name, mode = 'all') {
+    const includeImages = mode !== 'redgifs';
+    const includeVideos = mode === 'all';
+    const redgifsOnly = mode === 'redgifs';
+    const modeLabel = redgifsOnly ? 'redgifs only' : includeVideos ? 'images+videos' : 'images only';
     const key = name.toLowerCase();
     if (activeScrapes.has(key)) {
       console.log(`⏳ r/${key} — scrape already in progress, skipping`);
       return;
     }
     activeScrapes.add(key);
-    console.log(`🚀 r/${key} — starting scrape (${FEEDS.length} feeds × up to ${MAX_PAGES_PER_FEED} pages each)`);
+    console.log(`🚀 r/${key} — starting scrape [${modeLabel}] (${FEEDS.length} feeds × up to ${MAX_PAGES_PER_FEED} pages each)`);
     const startTime = Date.now();
 
     const db = getDb();
@@ -208,6 +266,8 @@ module.exports = function createSubredditRouter(getDb) {
 
     let total = sub.total_images || 0;
     let totalPages = 0;
+    let videosQueued = 0;
+    let redgifsQueued = 0;
 
     try {
       for (const feed of FEEDS) {
@@ -242,19 +302,26 @@ module.exports = function createSubredditRouter(getDb) {
         const listing = json && json.data;
         if (!listing || !listing.children || !listing.children.length) break;
 
-        // Collect image + video urls from this page
+        // Collect image + video + redgifs urls from this page
         const images = [];
         const videos = [];
+        const redgifs = [];
         for (const child of listing.children) {
           if (child.data) {
-            images.push(...extractImageUrls(child.data));
-            videos.push(...extractVideoUrls(child.data));
+            if (includeImages) images.push(...extractImageUrls(child.data));
+            if (includeVideos) videos.push(...extractVideoUrls(child.data));
+            if (redgifsOnly) redgifs.push(...extractRedgifsUrls(child.data));
           }
         }
-        console.log(`   └─ ${listing.children.length} posts scanned → ${images.length} image(s), ${videos.length} video(s) found`);
+        const parts = [`${listing.children.length} posts scanned →`];
+        if (includeImages) parts.push(`${images.length} image(s)`);
+        if (includeVideos) parts.push(`${videos.length} video(s)`);
+        if (redgifsOnly) parts.push(`${redgifs.length} redgif(s)`);
+        console.log(`   └─ ${parts.join(' ')} found`);
 
-        // Queue video downloads via BullMQ
+        // Queue video downloads via BullMQ (capped at MAX_VIDEOS)
         for (const vid of videos) {
+          if (videosQueued >= MAX_VIDEOS) break;
           try {
             const exists = await db.get(
               'SELECT id FROM subreddit_videos WHERE subreddit_id = ? AND url = ?', sub.id, vid.url
@@ -272,15 +339,44 @@ module.exports = function createSubredditRouter(getDb) {
                   subredditName: key,
                   title: vid.title,
                 }, { attempts: 3, backoff: { type: 'exponential', delay: 3000 } });
+                videosQueued++;
               }
             }
           } catch { /* dup */ }
         }
 
-        // Download in batches
+        // Queue RedGifs downloads via BullMQ (capped at MAX_REDGIFS)
+        for (const rg of redgifs) {
+          if (redgifsQueued >= MAX_REDGIFS) break;
+          try {
+            const exists = await db.get(
+              'SELECT id FROM subreddit_videos WHERE subreddit_id = ? AND url = ?', sub.id, rg.url
+            );
+            if (!exists) {
+              await db.run(
+                `INSERT OR IGNORE INTO subreddit_videos (subreddit_id, reddit_post_id, url, title, status) VALUES (?, ?, ?, ?, ?)`,
+                sub.id, rg.postId, rg.url, rg.title, 'queued'
+              );
+              const row = await db.get('SELECT id FROM subreddit_videos WHERE subreddit_id = ? AND url = ?', sub.id, rg.url);
+              if (row) {
+                await videoQueue.add('downloadVideo', {
+                  videoDbId: row.id,
+                  url: rg.url,
+                  subredditName: key,
+                  title: rg.title,
+                  redgifsId: rg.redgifsId,
+                }, { attempts: 3, backoff: { type: 'exponential', delay: 3000 } });
+                redgifsQueued++;
+              }
+            }
+          } catch { /* dup */ }
+        }
+
+        // Download images in batches (capped at MAX_IMAGES)
         let pageSaved = 0, pageSkipped = 0, pageFailed = 0;
-        for (let i = 0; i < images.length; i += CONCURRENT) {
-          const batch = images.slice(i, i + CONCURRENT);
+        if (includeImages && total < MAX_IMAGES) {
+        for (let i = 0; i < images.length && total < MAX_IMAGES; i += CONCURRENT) {
+          const batch = images.slice(i, Math.min(i + CONCURRENT, i + MAX_IMAGES - total));
           const results = await Promise.all(batch.map(async img => {
             const exists = await db.get(
               'SELECT id FROM subreddit_images WHERE subreddit_id = ? AND url = ?', sub.id, img.url
@@ -292,7 +388,7 @@ module.exports = function createSubredditRouter(getDb) {
           }));
 
           for (const r of results) {
-            if (!r) continue;
+            if (!r || total >= MAX_IMAGES) continue;
             try {
               await db.run(
                 `INSERT OR IGNORE INTO subreddit_images
@@ -306,10 +402,30 @@ module.exports = function createSubredditRouter(getDb) {
           }
           await db.run('UPDATE subreddits SET total_images = ? WHERE id = ?', total, sub.id);
         }
-        console.log(`   └─ 💾 ${pageSaved} saved, ⏭ ${pageSkipped} skipped (dup), ❌ ${pageFailed} failed  |  total: ${total}`);
+        }
+        const capInfo = [];
+        if (includeImages) capInfo.push(`images: ${total}/${MAX_IMAGES}`);
+        if (includeVideos) capInfo.push(`videos queued: ${videosQueued}/${MAX_VIDEOS}`);
+        if (redgifsOnly) capInfo.push(`redgifs queued: ${redgifsQueued}/${MAX_REDGIFS}`);
+        console.log(`   └─ 💾 ${pageSaved} saved, ⏭ ${pageSkipped} skipped (dup), ❌ ${pageFailed} failed  |  ${capInfo.join(', ')}`);
 
         totalPages++;
         await db.run('UPDATE subreddits SET pages_fetched = ? WHERE id = ?', totalPages, sub.id);
+
+        // Check caps — break page loop
+        if (includeImages && total >= MAX_IMAGES) {
+          console.log(`🛑 r/${key} — reached image cap (${MAX_IMAGES}), stopping feed`);
+          break;
+        }
+        if (includeVideos && videosQueued >= MAX_VIDEOS) {
+          console.log(`🛑 r/${key} — reached video cap (${MAX_VIDEOS}), stopping feed`);
+          break;
+        }
+        if (redgifsOnly && redgifsQueued >= MAX_REDGIFS) {
+          console.log(`🛑 r/${key} — reached RedGifs cap (${MAX_REDGIFS}), stopping`);
+          break;
+        }
+
         after = listing.after;
         if (!after) {
           console.log(`📭 r/${key} [${feedLabel}] — no more pages in this feed`);
@@ -320,11 +436,15 @@ module.exports = function createSubredditRouter(getDb) {
       }
       // small pause between feeds
       await new Promise(r => setTimeout(r, 1500));
+      // Check caps — break feed loop
+      if (includeImages && total >= MAX_IMAGES) break;
+      if (includeVideos && videosQueued >= MAX_VIDEOS) break;
+      if (redgifsOnly && redgifsQueued >= MAX_REDGIFS) break;
       }
 
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       await db.run('UPDATE subreddits SET status = ?, total_images = ? WHERE id = ?', 'complete', total, sub.id);
-      console.log(`✅ r/${key} — done! ${total} images saved in ${elapsed}s`);
+      console.log(`✅ r/${key} — done! ${total} images saved${redgifsOnly ? ', ' + redgifsQueued + ' redgifs queued' : ''} in ${elapsed}s`);
     } catch (err) {
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       console.error(`❌ r/${key} — scrape failed after ${elapsed}s:`, err.message || err);
@@ -354,7 +474,8 @@ module.exports = function createSubredditRouter(getDb) {
   router.post('/scrape', async (req, res) => {
     const name = (req.body.subreddit || '').trim().replace(/^\/?(r\/)?/, '').replace(/[^a-zA-Z0-9_]/g, '');
     if (!name) return res.redirect('/');
-    scrapeSubreddit(name).catch(e => console.error('scrapeSubreddit fatal:', e));
+    const mode = ['images', 'all', 'redgifs'].includes(req.body.mode) ? req.body.mode : 'images';
+    scrapeSubreddit(name, mode).catch(e => console.error('scrapeSubreddit fatal:', e));
     res.redirect(`/r/${encodeURIComponent(name)}`);
   });
 
@@ -506,18 +627,31 @@ module.exports = function createSubredditRouter(getDb) {
 
   // ---- BullMQ Video Download Worker ----
   const videoWorker = new Worker('videoDownloadQueue', async (job) => {
-    const { videoDbId, url, subredditName, title } = job.data;
+    const { videoDbId, url, subredditName, title, redgifsId } = job.data;
     const db = getDb();
     if (!db) throw new Error('DB not ready');
 
-    console.log(`🎬 Downloading video: ${title || url}`);
+    console.log(`🎬 Downloading video: ${title || url}${redgifsId ? ' (redgifs)' : ''}`);
     await db.run('UPDATE subreddit_videos SET status = ? WHERE id = ?', 'downloading', videoDbId);
 
-    const result = await downloadVideo(url);
+    // Resolve actual download URL for RedGifs
+    let downloadUrl = url;
+    if (redgifsId) {
+      const resolved = await resolveRedgifsUrl(redgifsId);
+      if (!resolved) {
+        await db.run('UPDATE subreddit_videos SET status = ? WHERE id = ?', 'failed', videoDbId);
+        console.log(`❌ RedGifs resolve failed: ${title || redgifsId}`);
+        throw new Error(`Failed to resolve RedGifs URL for: ${redgifsId}`);
+      }
+      downloadUrl = resolved;
+      console.log(`🔗 RedGifs resolved: ${redgifsId} → ${downloadUrl.slice(0, 80)}…`);
+    }
+
+    const result = await downloadVideo(downloadUrl);
     if (!result) {
       await db.run('UPDATE subreddit_videos SET status = ? WHERE id = ?', 'failed', videoDbId);
       console.log(`❌ Video download failed: ${title || url}`);
-      throw new Error(`Failed to download video: ${url}`);
+      throw new Error(`Failed to download video: ${downloadUrl}`);
     }
 
     await db.run(

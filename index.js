@@ -31,8 +31,8 @@ require('dotenv').config();
 
 const redditQueue = new Queue('redditQueue', {
   connection: {
-    host: 'localhost',
-    port: 6379,
+    host: process.env.REDIS_HOST || 'localhost',
+    port: parseInt(process.env.REDIS_PORT) || 6379,
   },
 });
 
@@ -313,7 +313,7 @@ app.listen(PORT, () => {
 let db;
 (async () => {
   db = await open({
-    filename: './data.db',
+    filename: process.env.DB_PATH || './data.db',
     driver: sqlite3.Database,
   });
 
@@ -532,8 +532,8 @@ const worker = new Worker('redditQueue', async job => {
   }
 }, {
   connection: {
-    host: 'localhost',
-    port: 6379,
+    host: process.env.REDIS_HOST || 'localhost',
+    port: parseInt(process.env.REDIS_PORT) || 6379,
   },
 });
 

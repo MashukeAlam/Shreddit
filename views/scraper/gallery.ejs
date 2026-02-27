@@ -63,8 +63,13 @@
         <% } %>
       </div>
     </div>
-    <form method="POST" action="/scrape" class="flex gap-2">
+    <form method="POST" action="/scrape" class="flex items-center gap-2">
       <input type="hidden" name="subreddit" value="<%= sub.name %>">
+      <select name="mode" class="px-3 py-2 bg-gray-800 border border-gray-700 text-sm text-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500">
+        <option value="images">Images only</option>
+        <option value="all">Images + Videos</option>
+        <option value="redgifs">RedGifs only (max 200)</option>
+      </select>
       <button class="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-sm font-medium rounded-lg transition">
         Re‑scrape
       </button>
