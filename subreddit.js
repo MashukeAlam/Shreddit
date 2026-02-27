@@ -234,6 +234,9 @@ module.exports = function createSubredditRouter(getDb) {
         UNIQUE(subreddit_id, url)
       );
     `);
+    // Indexes for fast counts & lookups
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_images_sub_ct ON subreddit_images(subreddit_id, content_type);`);
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_videos_sub_status ON subreddit_videos(subreddit_id, status);`);
     tablesReady = true;
   }
 
@@ -462,7 +465,15 @@ module.exports = function createSubredditRouter(getDb) {
       const db = getDb();
       if (!db) return res.status(503).send('DB not ready');
       await ensureTables();
-      const subs = await db.all('SELECT * FROM subreddits ORDER BY created_at DESC');
+      const subs = await db.all(`
+        SELECT s.*,
+          COALESCE(v.cnt, 0) AS total_videos,
+          COALESCE(g.cnt, 0) AS total_gifs
+        FROM subreddits s
+        LEFT JOIN (SELECT subreddit_id, COUNT(*) AS cnt FROM subreddit_videos WHERE status = 'done' GROUP BY subreddit_id) v ON v.subreddit_id = s.id
+        LEFT JOIN (SELECT subreddit_id, COUNT(*) AS cnt FROM subreddit_images WHERE content_type = 'image/gif' GROUP BY subreddit_id) g ON g.subreddit_id = s.id
+        ORDER BY s.created_at DESC
+      `);
       res.render('scraper/index', { subs });
     } catch (err) {
       console.error('GET / error', err);
@@ -488,11 +499,35 @@ module.exports = function createSubredditRouter(getDb) {
       const name = req.params.name.toLowerCase();
       const sub = await db.get('SELECT * FROM subreddits WHERE name = ? COLLATE NOCASE', name);
       if (!sub) return res.json({ status: 'not_found', count: 0 });
-      const imgRow = await db.get('SELECT COUNT(*) as cnt FROM subreddit_images WHERE subreddit_id = ?', sub.id);
-      const vidRow = await db.get('SELECT COUNT(*) as cnt FROM subreddit_videos WHERE subreddit_id = ? AND status = ?', sub.id, 'done');
-      const vidPending = await db.get('SELECT COUNT(*) as cnt FROM subreddit_videos WHERE subreddit_id = ? AND status != ?', sub.id, 'done');
-      res.json({ status: sub.status, count: imgRow.cnt, videos: vidRow.cnt, videosPending: vidPending.cnt, pages: sub.pages_fetched });
+      const counts = await db.get(`
+        SELECT
+          (SELECT COUNT(*) FROM subreddit_images WHERE subreddit_id = ?) AS imgCnt,
+          (SELECT COUNT(*) FROM subreddit_images WHERE subreddit_id = ? AND content_type = 'image/gif') AS gifCnt,
+          (SELECT COUNT(*) FROM subreddit_videos WHERE subreddit_id = ? AND status = 'done') AS vidCnt,
+          (SELECT COUNT(*) FROM subreddit_videos WHERE subreddit_id = ? AND status != 'done') AS vidPending
+      `, sub.id, sub.id, sub.id, sub.id);
+      res.json({ status: sub.status, count: counts.imgCnt, gifs: counts.gifCnt, videos: counts.vidCnt, videosPending: counts.vidPending, pages: sub.pages_fetched });
     } catch { res.json({ status: 'error', count: 0, videos: 0 }); }
+  });
+
+  // ---- API: delete subreddit and all its content ----
+  router.delete('/api/r/:name', async (req, res) => {
+    try {
+      const db = getDb();
+      if (!db) return res.json({ ok: false, error: 'DB not ready' });
+      await ensureTables();
+      const name = req.params.name.toLowerCase();
+      const sub = await db.get('SELECT id FROM subreddits WHERE name = ? COLLATE NOCASE', name);
+      if (!sub) return res.json({ ok: false, error: 'Not found' });
+      await db.run('DELETE FROM subreddit_images WHERE subreddit_id = ?', sub.id);
+      await db.run('DELETE FROM subreddit_videos WHERE subreddit_id = ?', sub.id);
+      await db.run('DELETE FROM subreddits WHERE id = ?', sub.id);
+      console.log(`🗑️  Deleted r/${name} and all its content`);
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('DELETE /api/r/:name error', err);
+      res.json({ ok: false, error: 'Server error' });
+    }
   });
 
   // ---- API: paginated image list ----
@@ -526,17 +561,25 @@ module.exports = function createSubredditRouter(getDb) {
       if (!sub) return res.json({ items: [] });
       const offset = Math.max(0, parseInt(req.query.offset) || 0);
       const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 20));
-      // Union images and videos ordered by creation time
+
+      // Images first (sorted by id), then videos (sorted by id).
+      // Use a computed sort_order column so images come first, videos after.
       const items = await db.all(`
-        SELECT id, title, 'image' as type FROM subreddit_images WHERE subreddit_id = ?
-        UNION ALL
-        SELECT id, title, 'video' as type FROM subreddit_videos WHERE subreddit_id = ? AND status = 'done'
-        ORDER BY id
+        SELECT * FROM (
+          SELECT id, title, 'image' as type, 0 as sort_order, id as sub_id FROM subreddit_images WHERE subreddit_id = ?
+          UNION ALL
+          SELECT id, title, 'video' as type, 1 as sort_order, id as sub_id FROM subreddit_videos WHERE subreddit_id = ? AND status = 'done'
+        )
+        ORDER BY sort_order, sub_id
         LIMIT ? OFFSET ?
       `, sub.id, sub.id, limit, offset);
-      const totalImg = (await db.get('SELECT COUNT(*) as cnt FROM subreddit_images WHERE subreddit_id = ?', sub.id)).cnt;
-      const totalVid = (await db.get('SELECT COUNT(*) as cnt FROM subreddit_videos WHERE subreddit_id = ? AND status = ?', sub.id, 'done')).cnt;
-      const total = totalImg + totalVid;
+
+      const counts = await db.get(`
+        SELECT
+          (SELECT COUNT(*) FROM subreddit_images WHERE subreddit_id = ?) AS imgCnt,
+          (SELECT COUNT(*) FROM subreddit_videos WHERE subreddit_id = ? AND status = 'done') AS vidCnt
+      `, sub.id, sub.id);
+      const total = counts.imgCnt + counts.vidCnt;
       res.json({ items, total, offset, limit, hasMore: offset + items.length < total });
     } catch { res.json({ items: [], total: 0, hasMore: false }); }
   });
@@ -552,13 +595,17 @@ module.exports = function createSubredditRouter(getDb) {
       const sub = await db.get('SELECT * FROM subreddits WHERE name = ? COLLATE NOCASE', name);
       if (!sub) return res.redirect('/');
 
-      const totalImg = (await db.get('SELECT COUNT(*) as cnt FROM subreddit_images WHERE subreddit_id = ?', sub.id)).cnt;
-      const totalVid = (await db.get('SELECT COUNT(*) as cnt FROM subreddit_videos WHERE subreddit_id = ? AND status = ?', sub.id, 'done')).cnt;
-      const totalVidPending = (await db.get('SELECT COUNT(*) as cnt FROM subreddit_videos WHERE subreddit_id = ? AND status != ?', sub.id, 'done')).cnt;
-      const totalMedia = totalImg + totalVid;
+      const counts = await db.get(`
+        SELECT
+          (SELECT COUNT(*) FROM subreddit_images WHERE subreddit_id = ?) AS imgCnt,
+          (SELECT COUNT(*) FROM subreddit_images WHERE subreddit_id = ? AND content_type = 'image/gif') AS gifCnt,
+          (SELECT COUNT(*) FROM subreddit_videos WHERE subreddit_id = ? AND status = 'done') AS vidCnt,
+          (SELECT COUNT(*) FROM subreddit_videos WHERE subreddit_id = ? AND status != 'done') AS vidPending
+      `, sub.id, sub.id, sub.id, sub.id);
+      const totalMedia = counts.imgCnt + counts.vidCnt;
       const downloading = sub.status === 'downloading';
 
-      res.render('scraper/gallery', { sub, totalImages: totalImg, totalVideos: totalVid, totalVideoPending: totalVidPending, totalMedia, downloading });
+      res.render('scraper/gallery', { sub, totalImages: counts.imgCnt, totalGifs: counts.gifCnt, totalVideos: counts.vidCnt, totalVideoPending: counts.vidPending, totalMedia, downloading });
     } catch (err) {
       console.error('GET /r/:name error', err);
       res.status(500).send('Server error');
