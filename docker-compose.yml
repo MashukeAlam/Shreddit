@@ -7,10 +7,10 @@ services:
       - PORT=3000
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - DB_PATH=/app/data/data.db
+      - DB_PATH=/app/data.db
       - RUN_CLIPBOARD_MONITOR=false
     volumes:
-      - app-data:/app/data
+      - ./data.db:/app/data.db
     depends_on:
       redis:
         condition: service_healthy
@@ -28,5 +28,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  app-data:
   redis-data:
